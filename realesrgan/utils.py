@@ -261,6 +261,193 @@ class RealESRGANer():
                 ), interpolation=cv2.INTER_LANCZOS4)
 
         return output, img_mode
+    
+    # ========================= Batch Processing Methods =========================
+    
+    def pre_process_batch(self, imgs_np: list):
+        """Pre-processes a batch of numpy images.
+        Args:
+            imgs_np (list[np.ndarray]): List of BGR numpy images of shape (H, W, C).
+                                         All images are expected to be of the same size.
+        Returns:
+            torch.Tensor: Batch of pre-processed images as a tensor (N, C, H, W) on self.device.
+                          Returns None if input list is empty.
+        """
+        if not imgs_np:
+            return None
+
+        batch_tensors = []
+        # Assuming all images in the batch have the same dimensions and mod_scale requirements
+        # We'll determine padding based on the first image, assuming it's representative.
+        
+        # Convert first image to determine padding requirements
+        _img_for_padding_check = torch.from_numpy(np.transpose(imgs_np[0], (2, 0, 1))).float()
+        
+        # Pre-pad (if any) - this pad is applied before mod_pad
+        # For batch processing, pre_pad is less common unless all images need exact same border handling
+        # before model. We will apply pre_pad here if self.pre_pad != 0
+        # However, if pre_pad is large, it might be better handled by individual image padding before batching
+        # For simplicity, we assume pre_pad is 0 or small enough for uniform batch application.
+        # If self.pre_pad != 0, a more robust solution might be needed if images vary a lot.
+        # Let's keep the original logic's spirit: pre_pad is applied, then mod_pad.
+
+        current_mod_pad_h, current_mod_pad_w = 0, 0
+        if self.scale == 2:
+            current_mod_scale = 2
+        elif self.scale == 1: # Typically for RealESRGAN, scale is 2 or 4. Scale 1 might be for other variants.
+            current_mod_scale = 4
+        else: # For scale 4, or others, often no mod_scale is enforced by default in some versions,
+              # or it's implicitly handled by network architecture or specific model needs.
+              # We'll follow the existing mod_scale logic. If self.scale is 4, self.mod_scale remains None from init.
+            current_mod_scale = self.mod_scale # Use self.mod_scale determined in __init__ or pre_process for single image
+
+        if current_mod_scale is not None:
+            # Temporarily use _img_for_padding_check to calculate mod_pad
+            # Apply pre_pad first if it exists
+            if self.pre_pad != 0:
+                _img_for_padding_check = F.pad(_img_for_padding_check.unsqueeze(0), (0, self.pre_pad, 0, self.pre_pad), 'reflect').squeeze(0)
+
+            _, h_temp, w_temp = _img_for_padding_check.size() # Get H, W after potential pre_pad
+            if h_temp % current_mod_scale != 0:
+                current_mod_pad_h = current_mod_scale - h_temp % current_mod_scale
+            if w_temp % current_mod_scale != 0:
+                current_mod_pad_w = current_mod_scale - w_temp % current_mod_scale
+        
+        # Store these calculated paddings to be used in post_process_batch
+        self.batch_mod_pad_h = current_mod_pad_h 
+        self.batch_mod_pad_w = current_mod_pad_w
+
+        for img_np in imgs_np:
+            img_tensor = torch.from_numpy(np.transpose(img_np, (2, 0, 1))).float().to(self.device)
+            if self.half:
+                img_tensor = img_tensor.half()
+
+            if self.pre_pad != 0:
+                img_tensor = F.pad(img_tensor.unsqueeze(0), (0, self.pre_pad, 0, self.pre_pad), 'reflect').squeeze(0)
+            
+            if current_mod_scale is not None and (current_mod_pad_h > 0 or current_mod_pad_w > 0) : # Only pad if necessary
+                img_tensor = F.pad(img_tensor.unsqueeze(0), (0, self.batch_mod_pad_w, 0, self.batch_mod_pad_h), 'reflect').squeeze(0)
+            
+            batch_tensors.append(img_tensor)
+        
+        self.batch_imgs_tensor = torch.stack(batch_tensors, dim=0)
+        return self.batch_imgs_tensor
+
+    def process_batch(self):
+        """Processes the batch of images using the model."""
+        # Model inference on the entire batch
+        self.batch_output_tensor = self.model(self.batch_imgs_tensor)
+
+    def post_process_batch(self):
+        """Post-processes the batch of output images.
+        Removes padding and converts tensors back to a list of numpy images.
+        """
+        # Retrieve mod_pad values calculated in pre_process_batch
+        current_mod_pad_h = getattr(self, 'batch_mod_pad_h', 0)
+        current_mod_pad_w = getattr(self, 'batch_mod_pad_w', 0)
+        
+        # Determine current_mod_scale based on self.scale, similar to pre_process
+        current_mod_scale = None
+        if self.scale == 2:
+            current_mod_scale = 2
+        elif self.scale == 1:
+            current_mod_scale = 4
+        # Add other scale conditions if necessary, or rely on self.mod_scale if set for other scales
+
+        # Remove extra mod pad
+        if current_mod_scale is not None and (current_mod_pad_h > 0 or current_mod_pad_w > 0):
+            _, _, h, w = self.batch_output_tensor.size()
+            self.batch_output_tensor = self.batch_output_tensor[:, :, 0:h - current_mod_pad_h * self.scale, 0:w - current_mod_pad_w * self.scale]
+        
+        # Remove prepad
+        if self.pre_pad != 0:
+            _, _, h, w = self.batch_output_tensor.size()
+            # Ensure pre_pad * self.scale doesn't exceed dimensions
+            h_unpad = max(0, h - self.pre_pad * self.scale)
+            w_unpad = max(0, w - self.pre_pad * self.scale)
+            self.batch_output_tensor = self.batch_output_tensor[:, :, 0:h_unpad, 0:w_unpad]
+        
+        # Convert batch tensor to list of numpy images
+        output_imgs_np = []
+        for i in range(self.batch_output_tensor.size(0)):
+            output_img_tensor = self.batch_output_tensor[i].squeeze().float().cpu().clamp_(0, 1).numpy()
+            output_img_np = np.transpose(output_img_tensor[[2, 1, 0], :, :], (1, 2, 0)) # RGB to BGR
+            output_imgs_np.append(output_img_np)
+            
+        return output_imgs_np
+
+    @torch.no_grad()
+    def enhance_batch_true(self, imgs_list: list, outscale=None):
+        """Upsamples a batch of images using RealESRGAN with true model-level batching.
+        Assumes tile_size = 0 (no tiling for batch mode).
+        Args:
+            imgs_list (list[np.ndarray]): A list of BGR numpy images.
+                                          All images MUST be of the same shape (H, W, C)
+                                          and normalized to [0, 1] range, float32 type.
+            outscale (float): The final output scale of the image. Default: None.
+        Returns:
+            list[np.ndarray]: List of upsampled BGR numpy images (uint8).
+        """
+        if not imgs_list:
+            return []
+        
+        # Store original input dimensions for potential final resizing by outscale
+        h_input, w_input = imgs_list[0].shape[0:2] 
+
+        # Normalize images to [0, 1] range (input to this function should already be BGR, float32, 0-1)
+        # The original enhance method does normalization. We need to ensure inputs to this batch method are consistent.
+        # For simplicity, we assume the input `imgs_list` are already BGR, np.float32, normalized to [0,1].
+        # If they are not, normalization should happen before calling this function or at the beginning here.
+        
+        # Example: If imgs_list contains uint8 BGR images:
+        processed_imgs_list = []
+        for img_np_uint8 in imgs_list:
+            img_np_float32 = img_np_uint8.astype(np.float32) / 255.
+            # Assuming BGR input, convert to RGB for pre_process_batch as it expects RGB transposition
+            img_rgb_float32 = cv2.cvtColor(img_np_float32, cv2.COLOR_BGR2RGB)
+            processed_imgs_list.append(img_rgb_float32)
+
+        # --- Pre-process the batch of images ---
+        # self.pre_process_batch expects a list of RGB float32 numpy images
+        batch_input_tensor = self.pre_process_batch(processed_imgs_list)
+        if batch_input_tensor is None:
+            return []
+
+        # --- Process the batch using the model ---
+        if self.tile_size > 0:
+            # Batch processing with tiling is complex and not implemented here.
+            # Fallback or raise error. For now, we assume tile_size = 0 for this batch method.
+            print("Warning: enhance_batch_true does not support tiling. Process might be slow or OOM for large images in batch.")
+            # Potentially, one could loop through the batch and apply single-image enhance with tiling:
+            # return [self.enhance(img, outscale=outscale)[0] for img in imgs_list] # This defeats batch purpose
+            # Or simply proceed without tiling, risking OOM for very large images in the batch.
+            # For now, let's assume self.tile_size is set to 0 if this method is called.
+            # If self.tile_size was intended, the caller should iterate and use self.enhance().
+            self.process_batch() # self.batch_imgs_tensor was set in pre_process_batch
+        else:
+            self.process_batch() # self.batch_imgs_tensor was set in pre_process_batch
+        
+        # --- Post-process the batch ---
+        output_imgs_rgb_np_list = self.post_process_batch() # Returns list of RGB float32 numpy images
+
+        final_output_list = []
+        for output_img_rgb_np in output_imgs_rgb_np_list:
+            # Convert RGB back to BGR
+            output_img_bgr_np = cv2.cvtColor(output_img_rgb_np, cv2.COLOR_RGB2BGR)
+
+            # Denormalize from [0,1] to [0,255] and convert to uint8
+            # Assuming max_range is 255 as 16-bit image batching is not explicitly handled here.
+            output_uint8 = (output_img_bgr_np * 255.0).round().astype(np.uint8)
+
+            if outscale is not None and outscale != float(self.scale):
+                output_uint8 = cv2.resize(
+                    output_uint8,
+                    (int(w_input * outscale), int(h_input * outscale)),
+                    interpolation=cv2.INTER_LANCZOS4
+                )
+            final_output_list.append(output_uint8)
+            
+        return final_output_list
 
 
 class PrefetchReader(threading.Thread):
